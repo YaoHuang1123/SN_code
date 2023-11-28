@@ -1,0 +1,275 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from PIL import Image
+import pandas as pd
+import numpy as np
+from sklearn.metrics import roc_auc_score
+import matplotlib.pyplot as plt
+from IPython.display import clear_output
+import os
+import time
+from PIL import Image
+
+start_time = time.time()
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f'Using device: {device}')
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(ConvBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        return self.relu(self.conv2(self.relu(self.conv1(x))))
+
+class UpConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(UpConv, self).__init__()
+        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        self.conv_block = ConvBlock(in_channels, out_channels)
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2])
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv_block(x)
+
+class UNet(nn.Module):
+    def __init__(self):
+        super(UNet, self).__init__()
+        self.enc1 = ConvBlock(1, 64)
+        self.enc2 = ConvBlock(64, 128)
+        self.enc3 = ConvBlock(128, 256)
+        self.enc4 = ConvBlock(256, 512)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.up3 = UpConv(512, 256)
+        self.up2 = UpConv(256, 128)
+        self.up1 = UpConv(128, 64)
+        self.classifier = nn.Conv2d(64, 2, kernel_size=1)
+
+    def forward(self, x):
+        enc1 = self.enc1(x)
+        pool1 = self.pool(enc1)
+        enc2 = self.enc2(pool1)
+        pool2 = self.pool(enc2)
+        enc3 = self.enc3(pool2)
+        pool3 = self.pool(enc3)
+        enc4 = self.enc4(pool3)
+        up3 = self.up3(enc4, enc3)
+        up2 = self.up2(up3, enc2)
+        up1 = self.up1(up2, enc1)
+        out = self.classifier(up1)
+        return out
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+model_before = UNet().to(device)
+model_before = nn.DataParallel(model_before, device_ids=[0, 1, 2])
+
+model_after = UNet().to(device)
+model_after = nn.DataParallel(model_after, device_ids=[0, 1, 2])
+
+criterion = nn.CrossEntropyLoss()
+optimizer_before = optim.Adam(model_before.parameters(), lr=0.001)
+optimizer_after = optim.Adam(model_after.parameters(), lr=0.001)
+
+class FullyConnected(nn.Module):
+    def __init__(self, input_size, num_classes):
+        super(FullyConnected, self).__init__()
+        self.fc1 = nn.Linear(input_size, 1024)
+        self.fc2 = nn.Linear(1024, 512)
+        self.fc3 = nn.Linear(512, 256)
+        self.fc4 = nn.Linear(256, 128)
+        self.fc5 = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))
+        x = self.fc5(x)
+        return x
+
+fc_model = FullyConnected(input_size=512, num_classes=2).to(device)
+fc_model = nn.DataParallel(fc_model, device_ids=[0, 1, 2])
+
+optimizer_fc = optim.Adam(fc_model.parameters(), lr=0.001)
+
+def forward_models(x_before, x_after):
+    x1 = model_before(x_before)
+    x2 = model_after(x_after)
+    x = torch.cat((x1, x2), dim=1)
+    x = F.adaptive_avg_pool2d(x, (1, 1))
+    x = x.view(x.size(0), -1)
+    out = fc_model(x)
+    return out
+
+train_transforms = transforms.Compose([
+    transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomVerticalFlip(),
+    transforms.ToTensor(),
+])
+
+
+class CustomDataset(Dataset):
+    def __init__(self, csv_file, root_dir, transform=None):
+        self.annotations = pd.read_csv(csv_file)
+        self.root_dir = root_dir
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.annotations)
+
+    def __getitem__(self, index):
+        img_name = os.path.join(self.root_dir, self.annotations.iloc[index, 0])
+        image = Image.open(img_name).convert('L')
+        label = int(self.annotations.iloc[index, 1])
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        return image, label
+
+train_data_dir_before = '训练集路径'
+val_data_dir_before1 = '第一个验证集路径'
+val_data_dir_before2 = '第二个验证集路径'
+
+train_data_dir_after = '训练集路径'
+val_data_dir_after1 = '第一个验证集路径'
+val_data_dir_after2 = '第二个验证集路径'
+
+train_loader_before = DataLoader(
+    CustomDataset(csv_file='路径'),
+    batch_size=8,
+    shuffle=True,
+    num_workers=0,
+    pin_memory=True
+)
+val_loader_before1 = DataLoader(
+    CustomDataset(csv_file='路径'),
+    batch_size=8,
+    shuffle=False,
+    num_workers=0,
+    pin_memory=True
+)
+val_loader_before2 = DataLoader(
+    CustomDataset(csv_file='路径'),
+    batch_size=8,
+    shuffle=False,
+    num_workers=0,
+    pin_memory=True
+)
+
+train_loader_after = DataLoader(
+    CustomDataset('路径'),
+    batch_size=8,
+    shuffle=True,
+    num_workers=0,
+    pin_memory=True
+)
+val_loader_after1 = DataLoader(
+    CustomDataset('路径'),
+    batch_size=8,
+    shuffle=False,
+    num_workers=0,
+    pin_memory=True
+)
+val_loader_after2 = DataLoader(
+    CustomDataset('路径'),
+    batch_size=8,
+    shuffle=False,
+    num_workers=0,
+    pin_memory=True
+)
+
+num_epochs = 50
+best_auc = 0  
+all_losses = [] 
+all_aucs = {'train': [], 'val1': [], 'val2': []}  
+
+for epoch in range(num_epochs):
+    model_before.train()
+    model_after.train()
+    fc_model.train()
+    
+    total_loss = 0
+    total_correct = 0
+    total_images = 0
+    
+    for batch in train_loader_before:
+        images_before, labels = batch
+        images_before = images_before.to(device)
+        labels = labels.to(device)
+
+        images_after, _ = next(iter(train_loader_after))
+        images_after = images_after.to(device)
+        
+        outputs = forward_models(images_before, images_after)
+        loss = criterion(outputs, labels)
+        
+        optimizer_before.zero_grad()
+        optimizer_after.zero_grad()
+        optimizer_fc.zero_grad()
+        
+        loss.backward()
+        
+        optimizer_before.step()
+        optimizer_after.step()
+        optimizer_fc.step()
+        
+        total_loss += loss.item()
+        _, predicted = torch.max(outputs, 1)
+        total_correct += (predicted == labels).sum().item()
+        total_images += labels.size(0)
+    
+    train_auc = calculate_auc(train_loader_before, model_before)
+    val1_auc = calculate_auc(val_loader_before1, model_before)
+    val2_auc = calculate_auc(val_loader_before2, model_before)
+    
+    print(f'Epoch {epoch+1}/{num_epochs}')
+    print(f'Training Loss: {total_loss/total_images:.4f}, Training Accuracy: {total_correct/total_images:.4f}')
+    print(f'Train AUC: {train_auc:.4f}, Val1 AUC: {val1_auc:.4f}, Val2 AUC: {val2_auc:.4f}')
+
+    clear_output(wait=True)
+    plt.figure(figsize=(15, 5))
+    plt.subplot(1, 3, 1)
+    plt.plot(all_losses, label='Training Loss')
+    plt.title('Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    plt.subplot(1, 3, 2)
+    plt.plot(all_aucs['train'], label='Train AUC')
+    plt.title('Train AUC')
+    plt.xlabel('Epoch')
+    plt.ylabel('AUC')
+    plt.legend()
+    
+    plt.subplot(1, 3, 3)
+    plt.plot(all_aucs['val1'], label='Val1 AUC')
+    plt.plot(all_aucs['val2'], label='Val2 AUC')
+    plt.title('Validation AUCs')
+    plt.xlabel('Epoch')
+    plt.ylabel('AUC')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.show()
+end_time = time.time()
+
+# 计算并打印运行时间
+elapsed_time = end_time - start_time
+print(f"Training completed in {elapsed_time:.2f} seconds")
